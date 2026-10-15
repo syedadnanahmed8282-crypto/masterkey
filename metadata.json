@@ -1,0 +1,6 @@
+{
+  "name": "MasterKey",
+  "description": "Personal password manager with AES-256-GCM hardware-backed encryption, biometric unlock, and Room local storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
