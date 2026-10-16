@@ -2,7 +2,9 @@ package com.example.data.security
 
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
+import android.security.keystore.UserNotAuthenticatedException
 import com.example.data.model.SecretPayload
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
@@ -27,8 +29,8 @@ class CryptoManager {
 
         private const val GCM_TAG_LENGTH_BITS = 128
         private const val GCM_NONCE_LENGTH_BYTES = 12
-        // Default validity duration in seconds after user authentication (10 minutes)
-        private const val AUTH_VALIDITY_DURATION_SECONDS = 600
+        // Time-bound authentication window in seconds after biometric / device PIN authentication
+        const val AUTH_VALIDITY_DURATION_SECONDS = 30
     }
 
     private val keyStore: KeyStore = try {
@@ -50,7 +52,7 @@ class CryptoManager {
 
     /**
      * Checks if the hardware-backed keystore key exists; if not, generates it with
-     * user authentication requirements.
+     * user authentication requirements (30s window with BIOMETRIC_STRONG or DEVICE_CREDENTIAL).
      */
     @Synchronized
     fun ensureKeyExists(): Boolean {
@@ -58,6 +60,23 @@ class CryptoManager {
             generateMasterKey()
         }
         return keyStore.containsAlias(KEY_ALIAS)
+    }
+
+    @Synchronized
+    fun deleteMasterKey() {
+        try {
+            if (keyStore.containsAlias(KEY_ALIAS)) {
+                keyStore.deleteEntry(KEY_ALIAS)
+            }
+        } catch (_: Exception) {
+            // Ignore deletion errors
+        }
+    }
+
+    @Synchronized
+    fun recreateMasterKey() {
+        deleteMasterKey()
+        generateMasterKey()
     }
 
     private fun generateMasterKey() {
@@ -74,9 +93,9 @@ class CryptoManager {
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setKeySize(256)
-                .setRandomizedEncryptionRequired(false) // We supply our own secure 12-byte random nonce per spec
+                .setRandomizedEncryptionRequired(false) // We supply our own cryptographically secure 12-byte random nonce
 
-            // Configure user authentication requirement
+            // Configure user authentication requirement (30 seconds window for BIOMETRIC_STRONG or DEVICE_CREDENTIAL)
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     builder.setUserAuthenticationParameters(
@@ -93,7 +112,7 @@ class CryptoManager {
                 keyGenerator.init(builder.build())
                 keyGenerator.generateKey()
             } catch (_: Exception) {
-                // Fallback for environments where device lock/biometrics are not enrolled yet
+                // Fallback for environments where device lock / biometrics are not enrolled yet
                 val fallbackBuilder = KeyGenParameterSpec.Builder(
                     KEY_ALIAS,
                     KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
@@ -107,10 +126,14 @@ class CryptoManager {
             }
         } catch (_: Exception) {
             // Host JVM / Robolectric environment fallback
-            val hostGen = KeyGenerator.getInstance("AES")
-            hostGen.init(256)
-            val generatedKey = hostGen.generateKey()
-            keyStore.setKeyEntry(KEY_ALIAS, generatedKey, null, null)
+            try {
+                val hostGen = KeyGenerator.getInstance("AES")
+                hostGen.init(256)
+                val generatedKey = hostGen.generateKey()
+                keyStore.setKeyEntry(KEY_ALIAS, generatedKey, null, null)
+            } catch (_: Exception) {
+                // Ignore test host keygen failures
+            }
         }
     }
 
@@ -170,6 +193,28 @@ class CryptoManager {
     }
 
     /**
+     * Returns an initialized Cipher for encrypting with CryptoObject (for pure BIOMETRIC_STRONG).
+     */
+    fun initEncryptCipher(): Pair<Cipher, ByteArray> {
+        val nonce = ByteArray(GCM_NONCE_LENGTH_BYTES)
+        secureRandom.nextBytes(nonce)
+        val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+        val spec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce)
+        cipher.init(Cipher.ENCRYPT_MODE, getSecretKey(), spec)
+        return Pair(cipher, nonce)
+    }
+
+    /**
+     * Returns an initialized Cipher for decrypting with CryptoObject (for pure BIOMETRIC_STRONG).
+     */
+    fun initDecryptCipher(nonce: ByteArray): Cipher {
+        val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+        val spec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce)
+        cipher.init(Cipher.DECRYPT_MODE, getSecretKey(), spec)
+        return cipher
+    }
+
+    /**
      * Encrypts the username, password, and notes into a single AES-256-GCM ciphertext
      * using a fresh cryptographically secure 12-byte nonce.
      */
@@ -181,17 +226,22 @@ class CryptoManager {
         }.toString()
 
         val plaintextBytes = json.toByteArray(StandardCharsets.UTF_8)
-
-        // Generate fresh 12-byte random nonce
         val nonce = ByteArray(GCM_NONCE_LENGTH_BYTES)
         secureRandom.nextBytes(nonce)
 
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
         val spec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce)
-        cipher.init(Cipher.ENCRYPT_MODE, getSecretKey(), spec)
 
-        val ciphertext = cipher.doFinal(plaintextBytes)
-        return Pair(ciphertext, nonce)
+        return try {
+            cipher.init(Cipher.ENCRYPT_MODE, getSecretKey(), spec)
+            val ciphertext = cipher.doFinal(plaintextBytes)
+            Pair(ciphertext, nonce)
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            recreateMasterKey()
+            cipher.init(Cipher.ENCRYPT_MODE, getSecretKey(), spec)
+            val ciphertext = cipher.doFinal(plaintextBytes)
+            Pair(ciphertext, nonce)
+        }
     }
 
     /**
@@ -261,7 +311,10 @@ class CryptoManager {
 
     /**
      * Seals raw bytes (such as the 32-byte DEK) using the Android Keystore hardware key.
+     * Throws UserNotAuthenticatedException if called without prior authentication in the 30-second window.
+     * Throws KeyPermanentlyInvalidatedException if biometric enrollment has changed.
      */
+    @Throws(UserNotAuthenticatedException::class, KeyPermanentlyInvalidatedException::class)
     fun encryptBytesWithKeystore(rawBytes: ByteArray): Pair<ByteArray, ByteArray> {
         val nonce = ByteArray(GCM_NONCE_LENGTH_BYTES)
         secureRandom.nextBytes(nonce)
@@ -276,11 +329,28 @@ class CryptoManager {
 
     /**
      * Unseals raw bytes (such as the 32-byte DEK) using the Android Keystore hardware key.
+     * Throws UserNotAuthenticatedException if called without prior authentication in the 30-second window.
+     * Throws KeyPermanentlyInvalidatedException if biometric enrollment has changed.
      */
+    @Throws(UserNotAuthenticatedException::class, KeyPermanentlyInvalidatedException::class)
     fun decryptBytesWithKeystore(ciphertext: ByteArray, nonce: ByteArray): ByteArray {
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
         val spec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce)
         cipher.init(Cipher.DECRYPT_MODE, getSecretKey(), spec)
+        return cipher.doFinal(ciphertext)
+    }
+
+    /**
+     * Encrypts raw bytes using a pre-authenticated Cipher obtained from BiometricPrompt.CryptoObject.
+     */
+    fun encryptWithCipher(cipher: Cipher, rawBytes: ByteArray): ByteArray {
+        return cipher.doFinal(rawBytes)
+    }
+
+    /**
+     * Decrypts raw bytes using a pre-authenticated Cipher obtained from BiometricPrompt.CryptoObject.
+     */
+    fun decryptWithCipher(cipher: Cipher, ciphertext: ByteArray): ByteArray {
         return cipher.doFinal(ciphertext)
     }
 

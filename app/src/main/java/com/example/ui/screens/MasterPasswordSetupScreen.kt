@@ -57,6 +57,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.ui.platform.LocalContext
+import androidx.fragment.app.FragmentActivity
 import com.example.ui.theme.BackgroundWhite
 import com.example.ui.theme.ErrorRed
 import com.example.ui.theme.OutlineBorder
@@ -81,6 +83,8 @@ fun MasterPasswordSetupScreen(
     val masterPasswordError by viewModel.masterPasswordError.collectAsStateWithLifecycle()
     val isLoading by viewModel.isMasterPasswordLoading.collectAsStateWithLifecycle()
     val focusManager = LocalFocusManager.current
+    val context = LocalContext.current
+    val activity = context as? FragmentActivity
 
     // Password strength evaluation
     val strengthScore by remember {
@@ -102,6 +106,7 @@ fun MasterPasswordSetupScreen(
     fun submitSetup() {
         focusManager.clearFocus()
         viewModel.setupMasterPassword(
+            activity = activity,
             passwordChars = masterPassword.toCharArray(),
             confirmChars = confirmPassword.toCharArray()
         )

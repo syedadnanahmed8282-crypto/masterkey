@@ -20,6 +20,10 @@ class BiometricAuthManager(private val context: Context) {
         return biometricManager.canAuthenticate(AUTH_AUTHENTICATORS)
     }
 
+    fun canAuthenticateStrongBiometric(): Int {
+        return biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+    }
+
     fun isAuthenticationAvailable(): Boolean {
         val status = canAuthenticate()
         return status == BiometricManager.BIOMETRIC_SUCCESS
@@ -36,13 +40,19 @@ class BiometricAuthManager(private val context: Context) {
         }
     }
 
+    /**
+     * Prompts for authentication using BIOMETRIC_STRONG or DEVICE_CREDENTIAL.
+     * This authorizes the Android Keystore time-bound authentication window (30 seconds)
+     * so that keys created with setUserAuthenticationParameters(30, AUTH_BIOMETRIC_STRONG or AUTH_DEVICE_CREDENTIAL)
+     * can be used immediately upon success.
+     */
     fun promptBiometricUnlock(
         activity: FragmentActivity,
         title: String = "MasterKey Vault",
         subtitle: String = "Authenticate to decrypt and access passwords",
         onSuccess: () -> Unit,
-        onError: (errorCode: Int, errString: CharSequence) -> Unit,
-        onFailed: () -> Unit
+        onError: (errorCode: Int, errString: CharSequence) -> Unit = { _, _ -> },
+        onFailed: () -> Unit = {}
     ) {
         val executor = ContextCompat.getMainExecutor(activity)
 
@@ -74,5 +84,50 @@ class BiometricAuthManager(private val context: Context) {
         )
 
         biometricPrompt.authenticate(promptInfo)
+    }
+
+    /**
+     * Authenticates using a CryptoObject with BIOMETRIC_STRONG when pure biometric authentication is preferred.
+     */
+    fun promptBiometricUnlockWithCrypto(
+        activity: FragmentActivity,
+        cryptoObject: BiometricPrompt.CryptoObject,
+        title: String = "MasterKey Vault",
+        subtitle: String = "Authenticate with biometric sensor",
+        onSuccess: (BiometricPrompt.AuthenticationResult) -> Unit,
+        onError: (errorCode: Int, errString: CharSequence) -> Unit = { _, _ -> },
+        onFailed: () -> Unit = {}
+    ) {
+        val executor = ContextCompat.getMainExecutor(activity)
+
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .setNegativeButtonText("Cancel")
+            .build()
+
+        val biometricPrompt = BiometricPrompt(
+            activity,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    onSuccess(result)
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                    onError(errorCode, errString)
+                }
+
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                    onFailed()
+                }
+            }
+        )
+
+        biometricPrompt.authenticate(promptInfo, cryptoObject)
     }
 }

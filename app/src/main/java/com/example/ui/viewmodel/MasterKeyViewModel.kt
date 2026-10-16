@@ -277,6 +277,7 @@ class MasterKeyViewModel(
     // --- Master Password & Vault Setup Flow ---
 
     fun setupMasterPassword(
+        activity: FragmentActivity? = null,
         passwordChars: CharArray,
         confirmChars: CharArray,
         onSuccess: () -> Unit = {}
@@ -310,11 +311,45 @@ class MasterKeyViewModel(
             _isMasterPasswordLoading.value = false
 
             if (result.isSuccess) {
-                appLockManager.unlock()
-                _vaultState.value = VaultState.UNLOCKED
-                _operationMessage.value = "Master password configured. Vault initialized."
-                triggerManualSync()
-                onSuccess()
+                val dek = result.getOrNull()
+                if (activity != null && biometricAuthManager.isAuthenticationAvailable() && dek != null) {
+                    // Authenticate in the same flow and seal the DEK with the Keystore key
+                    biometricAuthManager.promptBiometricUnlock(
+                        activity = activity,
+                        title = "Enable Quick Unlock",
+                        subtitle = "Authenticate to seal your vault key with Android Keystore",
+                        onSuccess = {
+                            try {
+                                masterKeyManager.sealDEKWithKeystore(dek, userId)
+                            } catch (_: Exception) {}
+                            appLockManager.unlock()
+                            _vaultState.value = VaultState.UNLOCKED
+                            _operationMessage.value = "Master password and biometric unlock configured."
+                            triggerManualSync()
+                            onSuccess()
+                        },
+                        onError = { _, _ ->
+                            appLockManager.unlock()
+                            _vaultState.value = VaultState.UNLOCKED
+                            _operationMessage.value = "Master password configured. Vault initialized."
+                            triggerManualSync()
+                            onSuccess()
+                        },
+                        onFailed = {
+                            appLockManager.unlock()
+                            _vaultState.value = VaultState.UNLOCKED
+                            _operationMessage.value = "Master password configured. Vault initialized."
+                            triggerManualSync()
+                            onSuccess()
+                        }
+                    )
+                } else {
+                    appLockManager.unlock()
+                    _vaultState.value = VaultState.UNLOCKED
+                    _operationMessage.value = "Master password configured. Vault initialized."
+                    triggerManualSync()
+                    onSuccess()
+                }
             } else {
                 _masterPasswordError.value = result.exceptionOrNull()?.message ?: "Failed to set up master password."
             }
@@ -322,6 +357,7 @@ class MasterKeyViewModel(
     }
 
     fun unlockWithMasterPassword(
+        activity: FragmentActivity? = null,
         passwordChars: CharArray,
         onSuccess: () -> Unit = {}
     ) {
@@ -357,11 +393,44 @@ class MasterKeyViewModel(
             _isMasterPasswordLoading.value = false
 
             if (result.isSuccess) {
-                appLockManager.unlock()
-                _vaultState.value = VaultState.UNLOCKED
-                _operationMessage.value = "Vault unlocked successfully"
-                triggerManualSync()
-                onSuccess()
+                val unwrappedDek = result.getOrNull()
+                if (activity != null && biometricAuthManager.isAuthenticationAvailable() && unwrappedDek != null) {
+                    biometricAuthManager.promptBiometricUnlock(
+                        activity = activity,
+                        title = "Enable Quick Unlock",
+                        subtitle = "Confirm Biometric / PIN to enable device unlock",
+                        onSuccess = {
+                            try {
+                                masterKeyManager.sealDEKWithKeystore(unwrappedDek, userId)
+                            } catch (_: Exception) {}
+                            appLockManager.unlock()
+                            _vaultState.value = VaultState.UNLOCKED
+                            _operationMessage.value = "Vault unlocked successfully"
+                            triggerManualSync()
+                            onSuccess()
+                        },
+                        onError = { _, _ ->
+                            appLockManager.unlock()
+                            _vaultState.value = VaultState.UNLOCKED
+                            _operationMessage.value = "Vault unlocked successfully"
+                            triggerManualSync()
+                            onSuccess()
+                        },
+                        onFailed = {
+                            appLockManager.unlock()
+                            _vaultState.value = VaultState.UNLOCKED
+                            _operationMessage.value = "Vault unlocked successfully"
+                            triggerManualSync()
+                            onSuccess()
+                        }
+                    )
+                } else {
+                    appLockManager.unlock()
+                    _vaultState.value = VaultState.UNLOCKED
+                    _operationMessage.value = "Vault unlocked successfully"
+                    triggerManualSync()
+                    onSuccess()
+                }
             } else {
                 _masterPasswordError.value = "Incorrect master password. Could not decrypt vault."
             }
@@ -378,16 +447,28 @@ class MasterKeyViewModel(
             title = "MasterKey Vault",
             subtitle = "Authenticate to decrypt stored credentials",
             onSuccess = {
-                val unsealedDek = masterKeyManager.unsealDEKWithKeystore()
-                if (unsealedDek != null) {
-                    appLockManager.unlock()
-                    _vaultState.value = VaultState.UNLOCKED
-                    triggerManualSync()
-                    onSuccess()
-                } else {
-                    // Hardware unseal failed or requires master password
-                    _vaultState.value = VaultState.NEEDS_MASTER_PASSWORD_ENTRY
-                    onError("Device authentication succeeded, but master password is required to decrypt.")
+                when (val result = masterKeyManager.unsealDEKWithKeystoreResult()) {
+                    is MasterKeyManager.UnsealResult.Success -> {
+                        appLockManager.unlock()
+                        _vaultState.value = VaultState.UNLOCKED
+                        triggerManualSync()
+                        onSuccess()
+                    }
+                    is MasterKeyManager.UnsealResult.KeyPermanentlyInvalidated -> {
+                        _vaultState.value = VaultState.NEEDS_MASTER_PASSWORD_ENTRY
+                        _masterPasswordError.value = "Biometric enrollment changed on device. Please enter Master Password once to re-seal your key."
+                        onError("Biometric enrollment changed. Master Password required.")
+                    }
+                    is MasterKeyManager.UnsealResult.NeedsAuthentication -> {
+                        _vaultState.value = VaultState.NEEDS_MASTER_PASSWORD_ENTRY
+                        _masterPasswordError.value = "Authentication expired. Please enter Master Password."
+                        onError("Authentication expired. Please enter Master Password.")
+                    }
+                    else -> {
+                        _vaultState.value = VaultState.NEEDS_MASTER_PASSWORD_ENTRY
+                        _masterPasswordError.value = "Master password required to unlock vault on this device."
+                        onError("Master Password required to decrypt vault.")
+                    }
                 }
             },
             onError = { _, errString ->

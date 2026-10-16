@@ -52,6 +52,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.ui.theme.BackgroundWhite
 import com.example.ui.theme.ErrorRed
 import com.example.ui.theme.OutlineBorder
+import androidx.compose.ui.platform.LocalContext
+import androidx.fragment.app.FragmentActivity
 import com.example.ui.theme.SkyBlueContainer
 import com.example.ui.theme.SkyBluePrimary
 import com.example.ui.theme.SurfaceCard
@@ -73,10 +75,15 @@ fun MasterPasswordEntryScreen(
     val email by viewModel.currentUserEmail.collectAsStateWithLifecycle()
 
     val focusManager = LocalFocusManager.current
+    val context = LocalContext.current
+    val activity = context as? FragmentActivity
 
     fun submitUnlock() {
         focusManager.clearFocus()
-        viewModel.unlockWithMasterPassword(masterPassword.toCharArray())
+        viewModel.unlockWithMasterPassword(
+            activity = activity,
+            passwordChars = masterPassword.toCharArray()
+        )
     }
 
     Surface(

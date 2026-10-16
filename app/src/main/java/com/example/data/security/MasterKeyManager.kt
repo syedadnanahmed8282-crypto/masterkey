@@ -1,6 +1,8 @@
 package com.example.data.security
 
 import android.content.Context
+import android.security.keystore.KeyPermanentlyInvalidatedException
+import android.security.keystore.UserNotAuthenticatedException
 import android.util.Base64
 import com.example.data.remote.SupabaseClientManager
 import com.example.data.remote.model.UserKeysDto
@@ -43,6 +45,22 @@ class MasterKeyManager(
         private const val PREF_LAST_SYNC_TIMESTAMP = "last_sync_timestamp"
     }
 
+    sealed class UnsealResult {
+        data class Success(val dek: ByteArray) : UnsealResult() {
+            override fun equals(other: Any?): Boolean {
+                if (this === other) return true
+                if (javaClass != other?.javaClass) return false
+                other as Success
+                return dek.contentEquals(other.dek)
+            }
+            override fun hashCode(): Int = dek.contentHashCode()
+        }
+        object NeedsAuthentication : UnsealResult()
+        object KeyPermanentlyInvalidated : UnsealResult()
+        object NoKeyFound : UnsealResult()
+        data class Error(val error: Throwable) : UnsealResult()
+    }
+
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val secureRandom = SecureRandom()
 
@@ -56,7 +74,6 @@ class MasterKeyManager(
     fun getActiveDEK(): ByteArray? = _activeDEK
 
     fun setActiveDEK(dek: ByteArray) {
-        // Wipe previous active DEK if present
         _activeDEK?.let { wipe(it) }
         _activeDEK = dek.copyOf()
     }
@@ -146,28 +163,53 @@ class MasterKeyManager(
     }
 
     /**
-     * Seals the DEK locally inside the device's Android Keystore hardware key
-     * (which enforces setUserAuthenticationRequired(true)).
+     * Seals the DEK locally inside the device's Android Keystore hardware key.
+     * Throws UserNotAuthenticatedException if called without prior authentication.
+     * Catches and handles KeyPermanentlyInvalidatedException.
      */
-    fun sealDEKWithKeystore(dek: ByteArray, userId: String? = null) {
-        val (ciphertext, nonce) = cryptoManager.encryptBytesWithKeystore(dek)
-        val b64Cipher = Base64.encodeToString(ciphertext, Base64.NO_WRAP)
-        val b64Nonce = Base64.encodeToString(nonce, Base64.NO_WRAP)
-        val editor = prefs.edit()
-            .putString(PREF_SEALED_DEK, b64Cipher)
-            .putString(PREF_SEALED_DEK_NONCE, b64Nonce)
-        if (userId != null) {
-            editor.putString(PREF_SEALED_USER_ID, userId)
+    @Throws(UserNotAuthenticatedException::class)
+    fun sealDEKWithKeystore(dek: ByteArray, userId: String? = null): Boolean {
+        return try {
+            val (ciphertext, nonce) = cryptoManager.encryptBytesWithKeystore(dek)
+            val b64Cipher = Base64.encodeToString(ciphertext, Base64.NO_WRAP)
+            val b64Nonce = Base64.encodeToString(nonce, Base64.NO_WRAP)
+            val editor = prefs.edit()
+                .putString(PREF_SEALED_DEK, b64Cipher)
+                .putString(PREF_SEALED_DEK_NONCE, b64Nonce)
+            if (userId != null) {
+                editor.putString(PREF_SEALED_USER_ID, userId)
+            }
+            editor.apply()
+            true
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            cryptoManager.recreateMasterKey()
+            clearSealedDEK()
+            false
+        } catch (e: UserNotAuthenticatedException) {
+            throw e
+        } catch (_: Exception) {
+            false
         }
-        editor.apply()
+    }
+
+    /**
+     * Attempts to seal the DEK silently, safely catching UserNotAuthenticatedException without crashing.
+     */
+    fun trySealDEKWithKeystore(dek: ByteArray, userId: String? = null): Boolean {
+        return try {
+            sealDEKWithKeystore(dek, userId)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /**
      * Unseals the DEK from the local Keystore hardware key using the active biometric/PIN session.
+     * Returns a rich UnsealResult handling UserNotAuthenticatedException and KeyPermanentlyInvalidatedException.
      */
-    fun unsealDEKWithKeystore(): ByteArray? {
-        val b64Cipher = prefs.getString(PREF_SEALED_DEK, null) ?: return null
-        val b64Nonce = prefs.getString(PREF_SEALED_DEK_NONCE, null) ?: return null
+    fun unsealDEKWithKeystoreResult(): UnsealResult {
+        val b64Cipher = prefs.getString(PREF_SEALED_DEK, null) ?: return UnsealResult.NoKeyFound
+        val b64Nonce = prefs.getString(PREF_SEALED_DEK_NONCE, null) ?: return UnsealResult.NoKeyFound
 
         val ciphertext = Base64.decode(b64Cipher, Base64.NO_WRAP)
         val nonce = Base64.decode(b64Nonce, Base64.NO_WRAP)
@@ -175,9 +217,22 @@ class MasterKeyManager(
         return try {
             val dek = cryptoManager.decryptBytesWithKeystore(ciphertext, nonce)
             setActiveDEK(dek)
-            dek
-        } catch (_: Exception) {
-            null
+            UnsealResult.Success(dek)
+        } catch (_: UserNotAuthenticatedException) {
+            UnsealResult.NeedsAuthentication
+        } catch (_: KeyPermanentlyInvalidatedException) {
+            cryptoManager.recreateMasterKey()
+            clearSealedDEK()
+            UnsealResult.KeyPermanentlyInvalidated
+        } catch (e: Exception) {
+            UnsealResult.Error(e)
+        }
+    }
+
+    fun unsealDEKWithKeystore(): ByteArray? {
+        return when (val result = unsealDEKWithKeystoreResult()) {
+            is UnsealResult.Success -> result.dek
+            else -> null
         }
     }
 
@@ -224,9 +279,12 @@ class MasterKeyManager(
      * 2. Derives KEK using PBKDF2 (600,000 iterations) and random salt.
      * 3. Wraps DEK with KEK.
      * 4. Stores salt, wrapped_dek, dek_nonce, kdf_params in Supabase user_keys table.
-     * 5. Seals DEK locally in Android Keystore.
+     * 5. Activates DEK in session and returns it for immediate biometric authentication wrapping.
      */
-    suspend fun setupNewMasterPassword(userId: String, masterPassword: CharArray): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun setupNewMasterPassword(
+        userId: String,
+        masterPassword: CharArray
+    ): Result<ByteArray> = withContext(Dispatchers.IO) {
         try {
             val salt = generateSalt()
             val dek = generateDEK()
@@ -251,12 +309,13 @@ class MasterKeyManager(
             // Save to Supabase
             supabaseManager.client.from("user_keys").upsert(userKeysDto)
 
-            // Store in active session and seal with hardware Keystore
+            // Store in active session
             setActiveDEK(dek)
-            sealDEKWithKeystore(dek, userId)
 
-            wipe(dek)
-            Result.success(Unit)
+            // Try sealing in Keystore silently if already authenticated
+            trySealDEKWithKeystore(dek, userId)
+
+            Result.success(dek.copyOf())
         } catch (e: Exception) {
             Result.failure(e)
         } finally {
@@ -268,13 +327,13 @@ class MasterKeyManager(
      * Unwraps the remote DEK using the entered master password on a new device or subsequent login:
      * 1. Derives KEK from entered password and stored salt.
      * 2. Unwraps wrapped DEK using AES-256-GCM.
-     * 3. If correct, activates DEK and seals in hardware Keystore for future biometric unlock.
+     * 3. Activates DEK in session and returns it for biometric sealing.
      */
     suspend fun unlockWithMasterPassword(
         userId: String,
         masterPassword: CharArray,
         remoteKeys: UserKeysDto
-    ): Result<Unit> = withContext(Dispatchers.IO) {
+    ): Result<ByteArray> = withContext(Dispatchers.IO) {
         try {
             val salt = Base64.decode(remoteKeys.salt, Base64.NO_WRAP)
             val wrappedDek = Base64.decode(remoteKeys.wrappedDek, Base64.NO_WRAP)
@@ -289,16 +348,17 @@ class MasterKeyManager(
             val kek = deriveKEK(masterPassword, salt, iterations)
             val unwrappedDek = try {
                 unwrapDEK(wrappedDek, dekNonce, kek)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 return@withContext Result.failure(IllegalArgumentException("Incorrect master password. Authentication failed."))
             }
 
-            // Set active in memory and seal in Keystore for this device
+            // Set active in memory
             setActiveDEK(unwrappedDek)
-            sealDEKWithKeystore(unwrappedDek, userId)
-            wipe(unwrappedDek)
 
-            Result.success(Unit)
+            // Try sealing in Keystore silently if already authenticated
+            trySealDEKWithKeystore(unwrappedDek, userId)
+
+            Result.success(unwrappedDek.copyOf())
         } catch (e: Exception) {
             Result.failure(e)
         } finally {
@@ -311,7 +371,6 @@ class MasterKeyManager(
      * 1. Derives new KEK from new master password and a fresh random salt.
      * 2. Re-wraps the EXISTING active DEK with the new KEK.
      * 3. Updates Supabase user_keys.
-     * Zero credentials need to be re-encrypted because the DEK is preserved!
      */
     suspend fun changeMasterPassword(
         userId: String,
@@ -341,7 +400,7 @@ class MasterKeyManager(
             )
 
             supabaseManager.client.from("user_keys").upsert(updatedKeys)
-            sealDEKWithKeystore(activeDek, userId)
+            trySealDEKWithKeystore(activeDek, userId)
 
             Result.success(Unit)
         } catch (e: Exception) {
