@@ -31,18 +31,28 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Setup Keystore and Secrets
         run: |
           echo "Setting up keystore and build configuration..."
-          # Restore debug keystore from base64 if present
+
+          # Restore debug keystore from base64 if present, or generate fresh one
           if [ -f "debug.keystore.base64" ]; then
             base64 -d debug.keystore.base64 > debug.keystore
-            echo "debug.keystore successfully restored."
+            echo "debug.keystore successfully restored from base64."
+          fi
+
+          if [ ! -f "debug.keystore" ]; then
+            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            echo "Generated fallback debug.keystore."
+          fi
+
+          # Ensure placeholder upload key exists so release signing config validation passes
+          if [ ! -f "my-upload-key.jks" ]; then
+            cp debug.keystore my-upload-key.jks
           fi
 
           # Prepare .env and local.properties with Supabase secrets
@@ -66,6 +76,11 @@ jobs:
             echo "SUPABASE_KEY=$KEY" >> local.properties
             echo "SUPABASE_KEY=$KEY" >> .env
             echo "Injected SUPABASE_KEY from GitHub Secrets."
+          fi
+
+          # Accept all Android SDK licenses automatically
+          if [ -d "$ANDROID_HOME/cmdline-tools/latest/bin" ]; then
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
           fi
 
       - name: Grant Execute Permission to Gradlew
