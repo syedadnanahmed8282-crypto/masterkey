@@ -1,0 +1,115 @@
+name: Build MasterKey Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Keystore and Secrets
+        run: |
+          echo "Setting up keystore and build configuration..."
+          # Restore debug keystore from base64 if present
+          if [ -f "debug.keystore.base64" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+            echo "debug.keystore successfully restored."
+          fi
+
+          # Prepare .env and local.properties with Supabase secrets
+          URL="${{ secrets.SUPABASE_URL }}"
+          KEY="${{ secrets.SUPABASE_KEY }}"
+          if [ -z "$KEY" ]; then
+            KEY="${{ secrets.SUPABASE_KEYKEY }}"
+          fi
+
+          if [ -n "$URL" ]; then
+            echo "SUPABASE_URL=$URL" > local.properties
+            echo "SUPABASE_URL=$URL" > .env
+            echo "Injected SUPABASE_URL from GitHub Secrets."
+          else
+            if [ -f ".env.example" ]; then
+              cp .env.example .env
+            fi
+          fi
+
+          if [ -n "$KEY" ]; then
+            echo "SUPABASE_KEY=$KEY" >> local.properties
+            echo "SUPABASE_KEY=$KEY" >> .env
+            echo "Injected SUPABASE_KEY from GitHub Secrets."
+          fi
+
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY || secrets.SUPABASE_KEYKEY }}
+        run: |
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          mkdir -p build-artifacts
+          cp app/build/outputs/apk/debug/app-debug.apk build-artifacts/MasterKey-debug.apk
+
+      - name: Build Release APK (Optional if Release Key provided)
+        if: env.HAS_RELEASE_KEY == 'true'
+        env:
+          HAS_RELEASE_KEY: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+          RELEASE_KEY_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PWD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PWD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$RELEASE_KEY_BASE64" | base64 -d > release.jks
+          export KEYSTORE_PATH="$(pwd)/release.jks"
+          export STORE_PASSWORD="$STORE_PWD"
+          export KEY_PASSWORD="$KEY_PWD"
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            cp app/build/outputs/apk/release/app-release.apk build-artifacts/MasterKey-release.apk
+          fi
+
+      - name: Upload APKs as Workflow Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MasterKey-APK
+          path: build-artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release on Tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-artifacts/*.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: true
